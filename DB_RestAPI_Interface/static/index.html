@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestione Items</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+        .form-section {
+            flex: 1;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 20px;
+        }
+        .list-section {
+            flex: 1;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        table, th, td {
+            border: 1px solid #ddd;
+        }
+        th, td {
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 10px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 5px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .delete-btn {
+            background-color: #f44336;
+        }
+        .delete-btn:hover {
+            background-color: #d32f2f;
+        }
+        .edit-btn {
+            background-color: #2196F3;
+        }
+        .edit-btn:hover {
+            background-color: #0b7dda;
+        }
+        .notification {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+            display: none;
+        }
+        .success {
+            background-color: #dff0d8;
+            border: 1px solid #d6e9c6;
+            color: #3c763d;
+        }
+        .error {
+            background-color: #f2dede;
+            border: 1px solid #ebccd1;
+            color: #a94442;
+        }
+    </style>
+</head>
+<body>
+    <h1>Gestione Items</h1>
+    
+    <div id="notification" class="notification"></div>
+    
+    <div class="container">
+        <div class="form-section">
+            <h2 id="form-title">Aggiungi nuovo Item</h2>
+            <form id="item-form">
+                <input type="hidden" id="item-id">
+                
+                <label for="name">Nome:</label>
+                <input type="text" id="name" required>
+                
+                <label for="description">Descrizione:</label>
+                <textarea id="description" rows="4" required></textarea>
+                
+                <button type="submit" id="submit-btn">Salva</button>
+                <button type="button" id="cancel-btn" style="display:none">Annulla</button>
+            </form>
+        </div>
+        
+        <div class="list-section">
+            <h2>Elenco Items</h2>
+            <table id="items-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Nome</th>
+                        <th>Descrizione</th>
+                        <th>Azioni</th>
+                    </tr>
+                </thead>
+                <tbody id="items-list">
+                    <!-- Gli items verranno inseriti qui -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <script>
+       // const API_URL = 'http://localhost:8000';
+        const API_URL = 'http://192.168.14.50:8000';
+        // Elementi DOM
+        const itemForm = document.getElementById('item-form');
+        const formTitle = document.getElementById('form-title');
+        const itemIdField = document.getElementById('item-id');
+        const nameField = document.getElementById('name');
+        const descriptionField = document.getElementById('description');
+        const submitBtn = document.getElementById('submit-btn');
+        const cancelBtn = document.getElementById('cancel-btn');
+        const itemsList = document.getElementById('items-list');
+        const notification = document.getElementById('notification');
+        
+        // Carica gli items all'avvio
+        document.addEventListener('DOMContentLoaded', loadItems);
+        
+        // Gestisce l'invio del form
+        itemForm.addEventListener('submit', saveItem);
+        
+        // Gestisce il pulsante annulla
+        cancelBtn.addEventListener('click', resetForm);
+        
+        // Carica tutti gli items dal server
+        async function loadItems() {
+            try {
+                const response = await fetch(`${API_URL}/items/`);
+                
+                if (!response.ok) {
+                    throw new Error(`Errore HTTP: ${response.status}`);
+                }
+                
+                const items = await response.json();
+                displayItems(items);
+            } catch (error) {
+                showNotification(`Errore nel caricamento degli items: ${error.message}`, 'error');
+            }
+        }
+        
+        // Mostra gli items nella tabella
+        function displayItems(items) {
+            itemsList.innerHTML = '';
+            
+            if (items.length === 0) {
+                itemsList.innerHTML = '<tr><td colspan="4" style="text-align: center;">Nessun item trovato</td></tr>';
+                return;
+            }
+            
+            items.forEach(item => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${item.id}</td>
+                    <td>${escapeHtml(item.name)}</td>
+                    <td>${escapeHtml(item.description)}</td>
+                    <td>
+                        <button class="edit-btn" onclick="editItem(${item.id})">Modifica</button>
+                        <button class="delete-btn" onclick="deleteItem(${item.id})">Elimina</button>
+                    </td>
+                `;
+                itemsList.appendChild(row);
+            });
+        }
+        
+        // Salva un nuovo item o aggiorna un item esistente
+        async function saveItem(event) {
+            event.preventDefault();
+            
+            const itemData = {
+                name: nameField.value,
+                description: descriptionField.value
+            };
+            
+            const isEditing = itemIdField.value !== '';
+            const url = isEditing ? `${API_URL}/items/${itemIdField.value}` : `${API_URL}/items/`;
+            const method = isEditing ? 'PUT' : 'POST';
+            
+            try {
+                const response = await fetch(url, {
+                    method: method,
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(itemData)
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Errore HTTP: ${response.status}`);
+                }
+                
+                const savedItem = await response.json();
+                
+                showNotification(
+                    isEditing 
+                        ? `Item #${savedItem.id} aggiornato con successo!` 
+                        : `Nuovo item #${savedItem.id} creato!`,
+                    'success'
+                );
+                
+                resetForm();
+                loadItems();
+            } catch (error) {
+                showNotification(`Errore nel salvataggio: ${error.message}`, 'error');
+            }
+        }
+        
+        // Prepara il form per modificare un item
+        async function editItem(id) {
+            try {
+                const response = await fetch(`${API_URL}/items/${id}`);
+                
+                if (!response.ok) {
+                    throw new Error(`Errore HTTP: ${response.status}`);
+                }
+                
+                const item = await response.json();
+                
+                // Popola il form
+                itemIdField.value = item.id;
+                nameField.value = item.name;
+                descriptionField.value = item.description;
+                
+                // Aggiorna l'UI
+                formTitle.textContent = `Modifica Item #${item.id}`;
+                submitBtn.textContent = 'Aggiorna';
+                cancelBtn.style.display = 'inline-block';
+                
+                // Scroll al form
+                itemForm.scrollIntoView({ behavior: 'smooth' });
+            } catch (error) {
+                showNotification(`Errore nel caricamento dell'item: ${error.message}`, 'error');
+            }
+        }
+        
+        // Elimina un item
+        async function deleteItem(id) {
+            if (!confirm(`Sei sicuro di voler eliminare l'item #${id}?`)) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_URL}/items/${id}`, {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Errore HTTP: ${response.status}`);
+                }
+                
+                showNotification(`Item #${id} eliminato con successo!`, 'success');
+                loadItems();
+            } catch (error) {
+                showNotification(`Errore nell'eliminazione: ${error.message}`, 'error');
+            }
+        }
+        
+        // Resetta il form allo stato iniziale
+        function resetForm() {
+            itemForm.reset();
+            itemIdField.value = '';
+            formTitle.textContent = 'Aggiungi nuovo Item';
+            submitBtn.textContent = 'Salva';
+            cancelBtn.style.display = 'none';
+        }
+        
+        // Mostra una notifica
+        function showNotification(message, type) {
+            notification.textContent = message;
+            notification.className = `notification ${type}`;
+            notification.style.display = 'block';
+            
+            // Nascondi la notifica dopo 5 secondi
+            setTimeout(() => {
+                notification.style.display = 'none';
+            }, 5000);
+        }
+        
+        // Funzione di escape per prevenire XSS
+        function escapeHtml(unsafe) {
+            return unsafe
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+    </script>
+</body>
+</html>
