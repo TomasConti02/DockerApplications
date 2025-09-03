@@ -1,3 +1,7 @@
+#docker compose -f ReplicaSetMongoDB.yaml up -d
+#docker compose -f ReplicaSetMongoDB.yaml down -v 
+#docker exec -it mongo1 mongosh -> entriamo 
+#docker exec -it mongo1 mongosh
 version: '3.8'
 services:
   mongo1:
@@ -6,9 +10,6 @@ services:
     command: mongod --replSet rs0 --bind_ip_all
     ports:
       - "27017:27017"
-    environment:
-      - MONGO_INITDB_ROOT_USERNAME=admin
-      - MONGO_INITDB_ROOT_PASSWORD=password123
     networks:
       - mongo-cluster
 
@@ -18,9 +19,6 @@ services:
     command: mongod --replSet rs0 --bind_ip_all
     ports:
       - "27018:27017"
-    environment:
-      - MONGO_INITDB_ROOT_USERNAME=admin
-      - MONGO_INITDB_ROOT_PASSWORD=password123
     networks:
       - mongo-cluster
 
@@ -30,9 +28,6 @@ services:
     command: mongod --replSet rs0 --bind_ip_all
     ports:
       - "27019:27017"
-    environment:
-      - MONGO_INITDB_ROOT_USERNAME=admin
-      - MONGO_INITDB_ROOT_PASSWORD=password123
     networks:
       - mongo-cluster
 
