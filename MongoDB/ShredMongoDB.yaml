@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # Config Server (singolo per semplicità)
+  configsvr:
+    image: mongo:6.0
+    container_name: configsvr
+    command: mongod --configsvr --replSet cfgrs --port 27019 --bind_ip_all
+    ports:
+      - "27019:27019"
+    networks:
+      - mongo-net
+
+  # Shard 1 (singolo nodo)
+  shard1:
+    image: mongo:6.0
+    container_name: shard1
+    command: mongod --shardsvr --replSet rs1 --port 27018 --bind_ip_all
+    ports:
+      - "27018:27018"
+    networks:
+      - mongo-net
+
+  # Shard 2 (singolo nodo)
+  shard2:
+    image: mongo:6.0
+    container_name: shard2
+    command: mongod --shardsvr --replSet rs2 --port 27020 --bind_ip_all
+    ports:
+      - "27020:27020"
+    networks:
+      - mongo-net
+
+  # Mongos Router
+  mongos:
+    image: mongo:6.0
+    container_name: mongos
+    command: mongos --configdb cfgrs/configsvr:27019 --bind_ip_all
+    ports:
+      - "27017:27017"
+    depends_on:
+      - configsvr
+      - shard1
+      - shard2
+    networks:
+      - mongo-net
+
+networks:
+  mongo-net:
+    driver: bridge
