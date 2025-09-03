@@ -76,3 +76,137 @@ graph TD;
     Arbiter["⚪ Arbiter (opzionale)"] -. Vota .-> Primary;
     Arbiter -. Vota .-> Secondary1;
     Arbiter -. Vota .-> Secondary2;
+# 🚀 MongoDB Sharded Cluster con Docker Compose
+
+Questo progetto configura un **cluster MongoDB sharded** utilizzando **Docker Compose**.  
+La configurazione include:
+
+- **3 Config Servers** (Replica Set `cfgrs`) → archiviano i metadati del cluster  
+- **2 Shard Replica Sets** (`rs1` e `rs2`) → archiviano i dati  
+- **1 Mongos Router** → punto di accesso per i client  
+
+---
+
+## 📂 Struttura del Cluster
+
+```
+                  +-------------------+
+                  |      Mongos       |
+                  | (porta 27017)     |
+                  +---------+---------+
+                            |
+                            v
+             +--------------+----------------+
+             |   Config Servers (cfgrs)     |
+             |  (porta 27019, Replica Set)  |
+             | configsvr1 - configsvr2 - configsvr3 |
+             +--------------+----------------+
+                            |
+       -----------------------------------------------
+       |                                             |
+       v                                             v
++-------------+                           +----------------+
+|   Shard 1   |                           |    Shard 2     |
+| ReplicaSet  |                           |  ReplicaSet    |
+| rs1         |                           | rs2            |
+| shard1a,b   |                           | shard2a,b      |
++-------------+                           +----------------+
+```
+
+---
+
+## ⚙️ Servizi Principali
+
+### 🔹 Config Servers
+- `configsvr1`, `configsvr2`, `configsvr3`
+- Ruolo: mantengono i **metadati del cluster**
+- Comando avvio:
+  ```bash
+  mongod --configsvr --replSet cfgrs --bind_ip_all
+  ```
+- Porta: `27019`
+
+---
+
+### 🔹 Shards
+- Ogni shard è un **Replica Set**
+- **Shard 1** → `rs1`: nodi `shard1a`, `shard1b`  
+- **Shard 2** → `rs2`: nodi `shard2a`, `shard2b`  
+- Comando avvio:
+  ```bash
+  mongod --shardsvr --replSet <nomeReplicaSet> --bind_ip_all
+  ```
+
+---
+
+### 🔹 Mongos Router
+- Servizio: `mongos`
+- Ruolo: router per le query, unico **entry point** per il client
+- Comando avvio:
+  ```bash
+  mongos --configdb cfgrs/configsvr1:27019,configsvr2:27019,configsvr3:27019 --bind_ip_all
+  ```
+- Porta: `27017` (quella a cui ti colleghi normalmente)
+
+---
+
+## ▶️ Avvio del Cluster
+
+1. Lancia i container:
+   ```bash
+   docker-compose up -d
+   ```
+
+2. Inizializza i **Replica Set dei Config Server**:
+   ```bash
+   docker exec -it configsvr1 mongosh
+   rs.initiate({
+     _id: "cfgrs",
+     configsvr: true,
+     members: [
+       { _id: 0, host: "configsvr1:27019" },
+       { _id: 1, host: "configsvr2:27019" },
+       { _id: 2, host: "configsvr3:27019" }
+     ]
+   })
+   ```
+
+3. Inizializza i **Replica Set degli Shard**:
+   ```bash
+   # Shard 1
+   docker exec -it shard1a mongosh --port 27018
+   rs.initiate({
+     _id: "rs1",
+     members: [
+       { _id: 0, host: "shard1a:27018" },
+       { _id: 1, host: "shard1b:27018" }
+     ]
+   })
+
+   # Shard 2
+   docker exec -it shard2a mongosh --port 27018
+   rs.initiate({
+     _id: "rs2",
+     members: [
+       { _id: 0, host: "shard2a:27018" },
+       { _id: 1, host: "shard2b:27018" }
+     ]
+   })
+   ```
+
+4. Configura gli shard dal **mongos**:
+   ```bash
+   docker exec -it mongos mongosh
+   sh.addShard("rs1/shard1a:27018,shard1b:27018")
+   sh.addShard("rs2/shard2a:27018,shard2b:27018")
+   ```
+
+---
+
+## 🛠️ Connessione
+
+Collegati al cluster tramite il router:
+```bash
+mongosh --port 27017
+```
+
