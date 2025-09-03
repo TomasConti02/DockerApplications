@@ -87,34 +87,6 @@ La configurazione include:
 
 ---
 
-## 📂 Struttura del Cluster
-
-```
-                  +-------------------+
-                  |      Mongos       |
-                  | (porta 27017)     |
-                  +---------+---------+
-                            |
-                            v
-             +--------------+----------------+
-             |   Config Servers (cfgrs)     |
-             |  (porta 27019, Replica Set)  |
-             | configsvr1 - configsvr2 - configsvr3 |
-             +--------------+----------------+
-                            |
-       -----------------------------------------------
-       |                                             |
-       v                                             v
-+-------------+                           +----------------+
-|   Shard 1   |                           |    Shard 2     |
-| ReplicaSet  |                           |  ReplicaSet    |
-| rs1         |                           | rs2            |
-| shard1a,b   |                           | shard2a,b      |
-+-------------+                           +----------------+
-```
-
----
-
 ## ⚙️ Servizi Principali
 
 ### 🔹 Config Servers
