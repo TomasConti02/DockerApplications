@@ -1,33 +1,75 @@
 version: '3.8'
 
 services:
-  # Config Server (singolo per semplicità)
-  configsvr:
+  # Config Server Replica Set (3 nodi per fault tolerance)
+  configsvr1:
     image: mongo:6.0
-    container_name: configsvr
+    container_name: configsvr1
     command: mongod --configsvr --replSet cfgrs --port 27019 --bind_ip_all
     ports:
       - "27019:27019"
     networks:
       - mongo-net
 
-  # Shard 1 (singolo nodo)
-  shard1:
+  configsvr2:
     image: mongo:6.0
-    container_name: shard1
+    container_name: configsvr2
+    command: mongod --configsvr --replSet cfgrs --port 27019 --bind_ip_all
+    networks:
+      - mongo-net
+
+  configsvr3:
+    image: mongo:6.0
+    container_name: configsvr3
+    command: mongod --configsvr --replSet cfgrs --port 27019 --bind_ip_all
+    networks:
+      - mongo-net
+
+  # Shard 1 Replica Set (3 nodi)
+  shard1a:
+    image: mongo:6.0
+    container_name: shard1a
     command: mongod --shardsvr --replSet rs1 --port 27018 --bind_ip_all
     ports:
       - "27018:27018"
     networks:
       - mongo-net
 
-  # Shard 2 (singolo nodo)
-  shard2:
+  shard1b:
     image: mongo:6.0
-    container_name: shard2
+    container_name: shard1b
+    command: mongod --shardsvr --replSet rs1 --port 27018 --bind_ip_all
+    networks:
+      - mongo-net
+
+  shard1c:
+    image: mongo:6.0
+    container_name: shard1c
+    command: mongod --shardsvr --replSet rs1 --port 27018 --bind_ip_all
+    networks:
+      - mongo-net
+
+  # Shard 2 Replica Set (3 nodi)
+  shard2a:
+    image: mongo:6.0
+    container_name: shard2a
     command: mongod --shardsvr --replSet rs2 --port 27020 --bind_ip_all
     ports:
       - "27020:27020"
+    networks:
+      - mongo-net
+
+  shard2b:
+    image: mongo:6.0
+    container_name: shard2b
+    command: mongod --shardsvr --replSet rs2 --port 27020 --bind_ip_all
+    networks:
+      - mongo-net
+
+  shard2c:
+    image: mongo:6.0
+    container_name: shard2c
+    command: mongod --shardsvr --replSet rs2 --port 27020 --bind_ip_all
     networks:
       - mongo-net
 
@@ -35,13 +77,19 @@ services:
   mongos:
     image: mongo:6.0
     container_name: mongos
-    command: mongos --configdb cfgrs/configsvr:27019 --bind_ip_all
+    command: mongos --configdb cfgrs/configsvr1:27019,configsvr2:27019,configsvr3:27019 --bind_ip_all
     ports:
       - "27017:27017"
     depends_on:
-      - configsvr
-      - shard1
-      - shard2
+      - configsvr1
+      - configsvr2
+      - configsvr3
+      - shard1a
+      - shard1b
+      - shard1c
+      - shard2a
+      - shard2b
+      - shard2c
     networks:
       - mongo-net
 
