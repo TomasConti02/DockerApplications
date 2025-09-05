@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Gestione Utenti</title>
+    <script>
+        const BASE_URL = "http://127.0.0.1:8000";
+        //firefox index.htm
+        async function addUser() {
+            const userId = document.getElementById("userId").value;
+            const name = document.getElementById("name").value;
+            const email = document.getElementById("email").value;
+
+            const response = await fetch(`${BASE_URL}/users`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ userId: parseInt(userId), name, email })
+            });
+
+            const data = await response.json();
+            alert("Utente aggiunto: " + JSON.stringify(data));
+            listUsers();
+        }
+
+        async function listUsers() {
+            const response = await fetch(`${BASE_URL}/users`);
+            const users = await response.json();
+
+            const table = document.getElementById("usersTable");
+            table.innerHTML = "<tr><th>ID</th><th>Nome</th><th>Email</th></tr>";
+
+            users.forEach(u => {
+                table.innerHTML += `<tr>
+                    <td>${u.userId}</td>
+                    <td>${u.name}</td>
+                    <td>${u.email}</td>
+                </tr>`;
+            });
+        }
+
+        async function findUser() {
+            const id = document.getElementById("searchId").value;
+            const response = await fetch(`${BASE_URL}/users/${id}`);
+            const user = await response.json();
+            alert("Utente trovato: " + JSON.stringify(user));
+        }
+    </script>
+</head>
+<body onload="listUsers()">
+    <h1>Gestione Utenti (FastAPI + MongoDB)</h1>
+
+    <h2>Aggiungi utente</h2>
+    <input type="number" id="userId" placeholder="ID">
+    <input type="text" id="name" placeholder="Nome">
+    <input type="email" id="email" placeholder="Email">
+    <button onclick="addUser()">Aggiungi</button>
+
+    <h2>Lista utenti</h2>
+    <table border="1" id="usersTable"></table>
+
+    <h2>Trova utente</h2>
+    <input type="number" id="searchId" placeholder="ID">
+    <button onclick="findUser()">Cerca</button>
+</body>
+</html>
