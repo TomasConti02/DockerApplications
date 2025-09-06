@@ -1,0 +1,75 @@
+helm repo add mongodb https://mongodb.github.io/helm-charts
+helm repo update
+
+helm install mongodb-kubernetes-operator mongodb/mongodb-kubernetes \
+  --namespace mongodb-operator \
+  --create-namespace
+
+kubectl get pods -n mongodb-operator
+
+apiVersion: mongodbcommunity.mongodb.com/v1
+kind: MongoDBCommunity
+metadata:
+  name: mongodb-cluster
+  namespace: mongodb
+spec:
+  members: 3
+  type: ReplicaSet
+  version: "6.0.0"
+  persistent: true
+  statefulSet:
+    spec:
+      serviceName: "mongodb-cluster"
+      replicas: 3
+      selector:
+        matchLabels:
+          app: mongodb-cluster
+      template:
+        metadata:
+          labels:
+            app: mongodb-cluster
+        spec:
+          containers:
+          - name: mongod
+            image: mongo:6.0
+            command:
+              - mongod
+              - "--replSet"
+              - "rs0"
+              - "--bind_ip_all"
+            ports:
+              - containerPort: 27017
+            volumeMounts:
+              - name: data
+                mountPath: /data/db
+  storage:
+    volumes:
+      - name: data
+        persistentVolumeClaim:
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 2Gi
+            storageClassName: standard
+
+
+kubectl apply -f mongodb-cluster.yaml
+
+
+
+kubectl autoscale statefulset mongodb-cluster \
+  --cpu-percent=80 \
+  --min=3 \
+  --max=6 \
+  --namespace=mongodb
+
+
+kubectl get mongodbcommunity -n mongodb
+
+
+
+kubectl describe mongodbcommunity mongodb-cluster -n mongodb
+
+
