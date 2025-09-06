@@ -7,6 +7,11 @@ helm install mongodb-kubernetes-operator mongodb/mongodb-kubernetes \
 
 kubectl get pods -n mongodb-operator
 
+kubectl create namespace mongodb
+
+kubectl create secret generic tomas   --from-literal=password='tomas'   -n mongodb
+
+
 apiVersion: mongodbcommunity.mongodb.com/v1
 kind: MongoDBCommunity
 metadata:
@@ -16,7 +21,22 @@ spec:
   members: 3
   type: ReplicaSet
   version: "6.0.0"
-  persistent: true
+
+  security:
+    authentication:
+      modes: ["SCRAM"]
+
+  users:
+    - name: tomas
+      db: admin
+      passwordSecretRef:
+        name: tomas   # <-- il secret che hai creato
+      roles:
+        - name: clusterAdmin
+          db: admin
+        - name: userAdminAnyDatabase
+          db: admin
+
   statefulSet:
     spec:
       serviceName: "mongodb-cluster"
@@ -42,17 +62,10 @@ spec:
             volumeMounts:
               - name: data
                 mountPath: /data/db
-  storage:
-    volumes:
-      - name: data
-        persistentVolumeClaim:
-          spec:
-            accessModes:
-              - ReadWriteOnce
-            resources:
-              requests:
-                storage: 2Gi
-            storageClassName: standard
+          volumes:
+            - name: data
+              emptyDir: {}
+
 
 
 kubectl apply -f mongodb-cluster.yaml
