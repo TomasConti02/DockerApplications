@@ -1,0 +1,57 @@
+kubectl apply -f mongo-sharded.yaml
+
+# aspetta che gli statefulset abbiano tutti i pod ready
+kubectl wait --for=condition=ready pod -l app=configsvr --timeout=120s
+kubectl wait --for=condition=ready pod -l app=shard1 --timeout=120s
+kubectl wait --for=condition=ready pod -l app=shard2 --timeout=120s
+kubectl wait --for=condition=ready pod -l app=mongos --timeout=120s
+
+kubectl get pods -o wide
+
+kubectl exec -it configsvr-0 -- bash -c \
+"mongo --port 27017 --eval 'rs.initiate({_id: \"configRepl\", configsvr: true, members: [
+  { _id: 0, host: \"configsvr-0.configsvr-svc.default.svc.cluster.local:27017\" },
+  { _id: 1, host: \"configsvr-1.configsvr-svc.default.svc.cluster.local:27017\" },
+  { _id: 2, host: \"configsvr-2.configsvr-svc.default.svc.cluster.local:27017\" }
+]})'"
+kubectl exec -it configsvr-0 -- mongo --eval "rs.status()"
+
+kubectl exec -it shard1-0 -- bash -c \
+"mongo --port 27017 --eval 'rs.initiate({_id: \"shard1\", members: [
+  { _id: 0, host: \"shard1-0.shard1-svc.default.svc.cluster.local:27017\" },
+  { _id: 1, host: \"shard1-1.shard1-svc.default.svc.cluster.local:27017\" },
+  { _id: 2, host: \"shard1-2.shard1-svc.default.svc.cluster.local:27017\" }
+]})'"
+kubectl exec -it shard1-0 -- mongo --eval "rs.status()"
+
+kubectl exec -it shard2-0 -- bash -c \
+"mongo --port 27017 --eval 'rs.initiate({_id: \"shard2\", members: [
+  { _id: 0, host: \"shard2-0.shard2-svc.default.svc.cluster.local:27017\" },
+  { _id: 1, host: \"shard2-1.shard2-svc.default.svc.cluster.local:27017\" },
+  { _id: 2, host: \"shard2-2.shard2-svc.default.svc.cluster.local:27017\" }
+]})'"
+kubectl exec -it shard2-0 -- mongo --eval "rs.status()"
+
+# accedi alla shell mongo tramite mongos
+kubectl exec -it deploy/mongos -- mongo --eval 'sh.status()'
+
+kubectl exec -it deploy/mongos -- mongo --eval \
+"sh.addShard('shard1/shard1-0.shard1-svc.default.svc.cluster.local:27017,shard1-1.shard1-svc.default.svc.cluster.local:27017,shard1-2.shard1-svc.default.svc.cluster.local:27017')"
+
+kubectl exec -it deploy/mongos -- mongo --eval \
+"sh.addShard('shard2/shard2-0.shard2-svc.default.svc.cluster.local:27017,shard2-1.shard2-svc.default.svc.cluster.local:27017,shard2-2.shard2-svc.default.svc.cluster.local:27017')"
+
+# verifica
+kubectl exec -it deploy/mongos -- mongo --eval "sh.status()"
+
+
+# abilita sharding sul DB "mydb"
+kubectl exec -it deploy/mongos -- mongo --eval "sh.enableSharding('mydb')"
+
+# shard key su collection mydb.users
+kubectl exec -it deploy/mongos -- mongo --eval "sh.shardCollection('mydb.users', { userId: 1 })"
+
+
+kubectl port-forward svc/mongos 27017:27017
+# poi dal tuo host:
+mongo --host localhost --port 27017
