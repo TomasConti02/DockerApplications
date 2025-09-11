@@ -1,0 +1,133 @@
+# MongoDB Cluster Setup Job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongodb-cluster-setup
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: mongodb-setup
+        image: mongo:6.0
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Funzione per verificare se un pod è pronto
+          wait_for_mongo() {
+            local host=$1
+            local max_attempts=30
+            local attempt=1
+            
+            echo "Waiting for MongoDB at $host to be ready..."
+            
+            while [ $attempt -le $max_attempts ]; do
+              if mongosh --host $host --eval "db.adminCommand('ping')" --quiet; then
+                echo "MongoDB at $host is ready!"
+                return 0
+              fi
+              echo "Attempt $attempt/$max_attempts: MongoDB at $host not ready yet..."
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+            echo "Timeout waiting for MongoDB at $host"
+            return 1
+          }
+
+          # Configurazione Config Server ReplicaSet
+          echo "=== CONFIGURING CONFIG SERVER REPLICASET ==="
+          wait_for_mongo "configsvr-0.configsvr-svc.default.svc.cluster.local:27017" || exit 1
+          
+          mongosh --host configsvr-0.configsvr-svc.default.svc.cluster.local:27017 <<EOF
+          rs.initiate({
+            _id: "configRepl",
+            configsvr: true,
+            members: [
+              {_id: 0, host: "configsvr-0.configsvr-svc.default.svc.cluster.local:27017"},
+              {_id: 1, host: "configsvr-1.configsvr-svc.default.svc.cluster.local:27017"},
+              {_id: 2, host: "configsvr-2.configsvr-svc.default.svc.cluster.local:27017"}
+            ]
+          })
+          EOF
+
+          echo "Waiting for config replica set to be initialized..."
+          sleep 10
+
+          # Configurazione Shard1 ReplicaSet
+          echo "=== CONFIGURING SHARD1 REPLICASET ==="
+          wait_for_mongo "shard1-0.shard1-svc.default.svc.cluster.local:27017" || exit 1
+          
+          mongosh --host shard1-0.shard1-svc.default.svc.cluster.local:27017 <<EOF
+          rs.initiate({
+            _id: "shard1",
+            members: [
+              {_id: 0, host: "shard1-0.shard1-svc.default.svc.cluster.local:27017"},
+              {_id: 1, host: "shard1-1.shard1-svc.default.svc.cluster.local:27017"},
+              {_id: 2, host: "shard1-2.shard1-svc.default.svc.cluster.local:27017"}
+            ]
+          })
+          EOF
+
+          # Configurazione Shard2 ReplicaSet
+          echo "=== CONFIGURING SHARD2 REPLICASET ==="
+          wait_for_mongo "shard2-0.shard2-svc.default.svc.cluster.local:27017" || exit 1
+          
+          mongosh --host shard2-0.shard2-svc.default.svc.cluster.local:27017 <<EOF
+          rs.initiate({
+            _id: "shard2",
+            members: [
+              {_id: 0, host: "shard2-0.shard2-svc.default.svc.cluster.local:27017"},
+              {_id: 1, host: "shard2-1.shard2-svc.default.svc.cluster.local:27017"},
+              {_id: 2, host: "shard2-2.shard2-svc.default.svc.cluster.local:27017"}
+            ]
+          })
+          EOF
+
+          echo "Waiting for shard replica sets to be initialized..."
+          sleep 20
+
+          # Configurazione Mongos - Aggiunta degli shard
+          echo "=== CONFIGURING MONGOS - ADDING SHARDS ==="
+          wait_for_mongo "mongos.default.svc.cluster.local:27017" || exit 1
+          
+          mongosh --host mongos.default.svc.cluster.local:27017 <<EOF
+          // Aggiungi shard1
+          sh.addShard("shard1/shard1-0.shard1-svc.default.svc.cluster.local:27017,shard1-1.shard1-svc.default.svc.cluster.local:27017,shard1-2.shard1-svc.default.svc.cluster.local:27017")
+          
+          // Aggiungi shard2
+          sh.addShard("shard2/shard2-0.shard2-svc.default.svc.cluster.local:27017,shard2-1.shard2-svc.default.svc.cluster.local:27017,shard2-2.shard2-svc.default.svc.cluster.local:27017")
+          
+          // Verifica lo stato del cluster
+          sh.status()
+          EOF
+
+          echo "=== MONGODB CLUSTER SETUP COMPLETED ==="
+---
+# ServiceAccount e Role per il job (opzionale, ma consigliato)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mongodb-setup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mongodb-setup
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mongodb-setup
+subjects:
+- kind: ServiceAccount
+  name: mongodb-setup
+roleRef:
+  kind: Role
+  name: mongodb-setup
+  apiGroup: rbac.authorization.k8s.io
