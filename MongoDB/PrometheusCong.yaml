@@ -1,0 +1,43 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: mongodb-test-alert
+  namespace: default
+  labels:
+    release: prometheus
+    app: kube-prometheus-stack
+    prometheus: prometheus
+spec:
+  groups:
+    - name: mongodb.rules
+      rules:
+        - alert: MongoDBTestAlert
+          expr: up{pod="pod-mongodb"} == 1
+          for: 0s
+          labels:
+            severity: critical
+          annotations:
+            summary: "Test Alert - MongoDB Pod Running"
+            description: "Pod {{ $labels.pod }} is running - TEST ONLY"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-prometheus-kube-prometheus-alertmanager
+  namespace: default
+type: Opaque
+stringData:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: 'guestbook-webhook'
+      group_by: ['alertname']
+      group_wait: 10s
+      group_interval: 30s
+      repeat_interval: 1m
+    receivers:
+    - name: 'guestbook-webhook'
+      webhook_configs:
+      - url: 'http://guestbook-webhook.guestbook-system.svc.cluster.local:8080/alerts'
+        send_resolved: true
