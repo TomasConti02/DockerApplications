@@ -1,0 +1,608 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	webappv1 "my.domain/operator/api/v1"
+)
+
+// OperatorReconciler reconciles a Operator object
+type OperatorReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+//+kubebuilder:rbac:groups=webapp.my.domain,resources=operators,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=webapp.my.domain,resources=operators/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=webapp.my.domain,resources=operators/finalizers,verbs=update
+//+kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+
+func (r *OperatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("operator", req.NamespacedName)
+
+	// 1. Fetch the Operator instance
+	operator := &webappv1.Operator{}
+	if err := r.Get(ctx, req.NamespacedName, operator); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Operator resource not found. Ignoring since object must be deleted")
+			return ctrl.Result{}, nil
+		}
+		logger.Error(err, "Failed to get Operator")
+		return ctrl.Result{}, err
+	}
+
+	// 2. Initialize status if needed
+	if operator.Status.Conditions == nil {
+		operator.Status.Conditions = []metav1.Condition{}
+	}
+
+	// 3. Update phase to Progressing
+	meta.SetStatusCondition(&operator.Status.Conditions, metav1.Condition{
+		Type:    "Available",
+		Status:  metav1.ConditionFalse,
+		Reason:  "Reconciling",
+		Message: "Starting reconciliation",
+	})
+	operator.Status.Phase = "Progressing"
+	operator.Status.ObservedGeneration = operator.Generation
+
+	// 4. Create Config Servers (StatefulSet + Service)
+	if err := r.reconcileConfigServers(ctx, operator); err != nil {
+		logger.Error(err, "Failed to reconcile Config Servers")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileConfigService(ctx, operator); err != nil {
+		logger.Error(err, "Failed to reconcile Config Service")
+		return ctrl.Result{}, err
+	}
+
+	// 5. Create Shards (StatefulSets + Services)
+	if err := r.reconcileShards(ctx, operator); err != nil {
+		logger.Error(err, "Failed to reconcile Shards")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileShardServices(ctx, operator); err != nil {
+		logger.Error(err, "Failed to reconcile Shard Services")
+		return ctrl.Result{}, err
+	}
+
+	// 6. Create Mongos Router (Deployment + Service)
+	if err := r.reconcileMongos(ctx, operator); err != nil {
+		logger.Error(err, "Failed to reconcile Mongos")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileMongosService(ctx, operator); err != nil {
+		logger.Error(err, "Failed to reconcile Mongos Service")
+		return ctrl.Result{}, err
+	}
+
+	// 7. Check if all pods are ready
+	allReady, err := r.checkPodsReady(ctx, operator.Namespace, operator.Name)
+	if err != nil {
+		logger.Error(err, "Failed to check pod readiness")
+		return ctrl.Result{}, err
+	}
+	if allReady {
+		logger.Info("🎉 CI SIAMOOOOO 🎉 Tutti i pod sono Ready!")
+		// Creiamo il Job di setup
+		if err := r.reconcileSetupJob(ctx, operator); err != nil {
+			logger.Error(err, "Failed to reconcile Setup Job")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// 8. Update status
+	operator.Status.ConfigReady = true
+	operator.Status.ShardsReady = operator.Spec.Shards
+	operator.Status.MongosReady = true
+	operator.Status.Phase = "Ready"
+	meta.SetStatusCondition(&operator.Status.Conditions, metav1.Condition{
+		Type:    "Available",
+		Status:  metav1.ConditionTrue,
+		Reason:  "Reconciled",
+		Message: "MongoDB cluster components created successfully",
+	})
+
+	// 9. Update status with retry for concurrency issues
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Get the latest version of the operator
+		if err := r.Get(ctx, req.NamespacedName, operator); err != nil {
+			return err
+		}
+		return r.Status().Update(ctx, operator)
+	}); err != nil {
+		logger.Error(err, "Failed to update Operator status")
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Reconciliation completed successfully")
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+func (r *OperatorReconciler) reconcileConfigService(ctx context.Context, operator *webappv1.Operator) error {
+	logger := log.FromContext(ctx)
+
+	configService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-config-service", operator.Name),
+			Namespace: operator.Namespace,
+			Labels:    map[string]string{"app": "mongodb-config", "operator": operator.Name},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:      corev1.ServiceTypeClusterIP,
+			ClusterIP: "None", // Headless service for StatefulSet
+			Selector:  map[string]string{"app": "mongodb-config", "operator": operator.Name},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "mongodb",
+					Port:       27017,
+					TargetPort: intstr.FromInt(27017),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+
+	// Set controller reference
+	if err := ctrl.SetControllerReference(operator, configService, r.Scheme); err != nil {
+		return err
+	}
+
+	// Create or Update
+	existing := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: configService.Name, Namespace: configService.Namespace}, existing)
+	if err != nil && errors.IsNotFound(err) {
+		logger.Info("Creating Config Service", "name", configService.Name)
+		return r.Create(ctx, configService)
+	} else if err != nil {
+		return err
+	}
+
+	logger.Info("Config Service already exists", "name", configService.Name)
+	return nil
+}
+
+func (r *OperatorReconciler) reconcileShardServices(ctx context.Context, operator *webappv1.Operator) error {
+	logger := log.FromContext(ctx)
+
+	for i := 0; i < operator.Spec.Shards; i++ {
+		shardServiceName := fmt.Sprintf("%s-shard-%d-service", operator.Name, i)
+
+		shardService := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      shardServiceName,
+				Namespace: operator.Namespace,
+				Labels:    map[string]string{"app": "mongodb-shard", "shard": fmt.Sprintf("%d", i), "operator": operator.Name},
+			},
+			Spec: corev1.ServiceSpec{
+				Type:      corev1.ServiceTypeClusterIP,
+				ClusterIP: "None", // Headless service for StatefulSet
+				Selector:  map[string]string{"app": "mongodb-shard", "shard": fmt.Sprintf("%d", i), "operator": operator.Name},
+				Ports: []corev1.ServicePort{
+					{
+						Name:       "mongodb",
+						Port:       27017,
+						TargetPort: intstr.FromInt(27017),
+						Protocol:   corev1.ProtocolTCP,
+					},
+				},
+			},
+		}
+
+		// Set controller reference
+		if err := ctrl.SetControllerReference(operator, shardService, r.Scheme); err != nil {
+			return err
+		}
+
+		// Create or Update
+		existing := &corev1.Service{}
+		err := r.Get(ctx, types.NamespacedName{Name: shardService.Name, Namespace: shardService.Namespace}, existing)
+		if err != nil && errors.IsNotFound(err) {
+			logger.Info("Creating Shard Service", "name", shardService.Name, "shard", i)
+			if err := r.Create(ctx, shardService); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *OperatorReconciler) reconcileMongosService(ctx context.Context, operator *webappv1.Operator) error {
+	logger := log.FromContext(ctx)
+
+	mongosService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-mongos-service", operator.Name),
+			Namespace: operator.Namespace,
+			Labels:    map[string]string{"app": "mongodb-mongos", "operator": operator.Name},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{"app": "mongodb-mongos", "operator": operator.Name},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "mongodb",
+					Port:       27017,
+					TargetPort: intstr.FromInt(27017),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+
+	// Set controller reference
+	if err := ctrl.SetControllerReference(operator, mongosService, r.Scheme); err != nil {
+		return err
+	}
+
+	// Create or Update
+	existing := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: mongosService.Name, Namespace: mongosService.Namespace}, existing)
+	if err != nil && errors.IsNotFound(err) {
+		logger.Info("Creating Mongos Service", "name", mongosService.Name)
+		return r.Create(ctx, mongosService)
+	} else if err != nil {
+		return err
+	}
+
+	logger.Info("Mongos Service already exists", "name", mongosService.Name)
+	return nil
+}
+
+func (r *OperatorReconciler) reconcileSetupJob(ctx context.Context, operator *webappv1.Operator) error {
+	logger := log.FromContext(ctx)
+
+	setupJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-setup-job", operator.Name),
+			Namespace: operator.Namespace,
+			Labels:    map[string]string{"app": "mongodb-setup", "operator": operator.Name},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "mongodb-setup", "operator": operator.Name},
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:  "setup",
+							Image: "mongo:7.0",
+							Command: []string{
+								"sh", "-c",
+								fmt.Sprintf(`echo "Setup job running..." &&
+								mongosh --host %s-config-0.%s-config-service:27017 <<EOF
+								rs.initiate({
+  								_id: "configReplSet",
+  								configsvr: true,
+  								members: [
+  									{_id: 0, host: "%s-config-0.%s-config-service:27017"},
+    								{_id: 1, host: "%s-config-1.%s-config-service:27017"},
+    								{_id: 2, host: "%s-config-2.%s-config-service:27017"}
+  								]
+							});
+							EOF
+							echo "Replica set config inizializzato"
+								`, operator.Name, operator.Name, operator.Name, operator.Name, operator.Name, operator.Name, operator.Name, operator.Name),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Set controller reference
+	if err := ctrl.SetControllerReference(operator, setupJob, r.Scheme); err != nil {
+		return err
+	}
+
+	// Create only if not exists
+	existing := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: setupJob.Name, Namespace: setupJob.Namespace}, existing)
+	if err != nil && errors.IsNotFound(err) {
+		logger.Info("Creating Setup Job", "name", setupJob.Name)
+		return r.Create(ctx, setupJob)
+	} else if err != nil {
+		return err
+	}
+
+	logger.Info("Setup Job already exists", "name", setupJob.Name)
+	return nil
+}
+
+func (r *OperatorReconciler) checkPodsReady(ctx context.Context, namespace, operatorName string) (bool, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{"operator": operatorName}); err != nil {
+		return false, err
+	}
+
+	if len(podList.Items) == 0 {
+		return false, nil
+	}
+
+	for _, pod := range podList.Items {
+		ready := false
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (r *OperatorReconciler) reconcileConfigServers(ctx context.Context, operator *webappv1.Operator) error {
+	logger := log.FromContext(ctx)
+	configStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-config", operator.Name),
+			Namespace: operator.Namespace,
+			Labels:    map[string]string{"app": "mongodb-config", "operator": operator.Name},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:    int32Ptr(int32(operator.Spec.ConfigReplicas)),
+			ServiceName: fmt.Sprintf("%s-config-service", operator.Name),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "mongodb-config", "operator": operator.Name},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "mongodb-config", "operator": operator.Name},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "mongodb",
+							Image: operator.Spec.MongoImage,
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: 27017, Name: "mongodb"},
+							},
+							Command: []string{"mongod", "--configsvr", "--replSet", "configReplSet", "--bind_ip_all"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Set controller reference
+	if err := ctrl.SetControllerReference(operator, configStatefulSet, r.Scheme); err != nil {
+		return err
+	}
+
+	// Create or Update with retry
+	existing := &appsv1.StatefulSet{}
+	err := r.Get(ctx, types.NamespacedName{Name: configStatefulSet.Name, Namespace: configStatefulSet.Namespace}, existing)
+	if err != nil && errors.IsNotFound(err) {
+		logger.Info("Creating Config Server StatefulSet", "name", configStatefulSet.Name)
+		return r.Create(ctx, configStatefulSet)
+	} else if err != nil {
+		return err
+	}
+
+	// Check if update is needed
+	if !r.statefulSetNeedsUpdate(existing, configStatefulSet) {
+		return nil
+	}
+
+	// Update with retry for concurrency issues
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Get the latest version
+		if err := r.Get(ctx, types.NamespacedName{Name: existing.Name, Namespace: existing.Namespace}, existing); err != nil {
+			return err
+		}
+		existing.Spec = configStatefulSet.Spec
+		logger.Info("Updating Config Server StatefulSet", "name", configStatefulSet.Name)
+		return r.Update(ctx, existing)
+	})
+}
+
+func (r *OperatorReconciler) reconcileShards(ctx context.Context, operator *webappv1.Operator) error {
+	logger := log.FromContext(ctx)
+	for i := 0; i < operator.Spec.Shards; i++ {
+		shardName := fmt.Sprintf("%s-shard-%d", operator.Name, i)
+
+		shardStatefulSet := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      shardName,
+				Namespace: operator.Namespace,
+				Labels:    map[string]string{"app": "mongodb-shard", "shard": fmt.Sprintf("%d", i), "operator": operator.Name},
+			},
+			Spec: appsv1.StatefulSetSpec{
+				Replicas:    int32Ptr(int32(operator.Spec.Replicas)),
+				ServiceName: fmt.Sprintf("%s-shard-%d-service", operator.Name, i),
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "mongodb-shard", "shard": fmt.Sprintf("%d", i), "operator": operator.Name},
+				},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{"app": "mongodb-shard", "shard": fmt.Sprintf("%d", i), "operator": operator.Name},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name:  "mongodb",
+								Image: operator.Spec.MongoImage,
+								Ports: []corev1.ContainerPort{
+									{ContainerPort: 27017, Name: "mongodb"},
+								},
+								Command: []string{"mongod", "--shardsvr", "--replSet", fmt.Sprintf("shardReplSet%d", i), "--bind_ip_all"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		// Set controller reference
+		if err := ctrl.SetControllerReference(operator, shardStatefulSet, r.Scheme); err != nil {
+			return err
+		}
+
+		// Create or Update with retry
+		existing := &appsv1.StatefulSet{}
+		err := r.Get(ctx, types.NamespacedName{Name: shardStatefulSet.Name, Namespace: shardStatefulSet.Namespace}, existing)
+		if err != nil && errors.IsNotFound(err) {
+			logger.Info("Creating Shard StatefulSet", "name", shardStatefulSet.Name, "shard", i)
+			return r.Create(ctx, shardStatefulSet)
+		} else if err != nil {
+			return err
+		}
+
+		// Check if update is needed
+		if !r.statefulSetNeedsUpdate(existing, shardStatefulSet) {
+			continue
+		}
+
+		// Update with retry for concurrency issues
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Get the latest version
+			if err := r.Get(ctx, types.NamespacedName{Name: existing.Name, Namespace: existing.Namespace}, existing); err != nil {
+				return err
+			}
+			existing.Spec = shardStatefulSet.Spec
+			logger.Info("Updating Shard StatefulSet", "name", shardStatefulSet.Name, "shard", i)
+			return r.Update(ctx, existing)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *OperatorReconciler) reconcileMongos(ctx context.Context, operator *webappv1.Operator) error {
+	logger := log.FromContext(ctx)
+	mongosDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-mongos", operator.Name),
+			Namespace: operator.Namespace,
+			Labels:    map[string]string{"app": "mongodb-mongos", "operator": operator.Name},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1), // Single mongos for testing
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "mongodb-mongos", "operator": operator.Name},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "mongodb-mongos", "operator": operator.Name},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "mongos",
+							Image: operator.Spec.MongoImage,
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: 27017, Name: "mongodb"},
+							},
+							Command: []string{"mongos", "--configdb", fmt.Sprintf("configReplSet/%s-config-0.%s-config-service:27017,%s-config-1.%s-config-service:27017,%s-config-2.%s-config-service:27017", operator.Name, operator.Name, operator.Name, operator.Name, operator.Name, operator.Name), "--bind_ip_all"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Set controller reference
+	if err := ctrl.SetControllerReference(operator, mongosDeployment, r.Scheme); err != nil {
+		return err
+	}
+
+	// Create or Update with retry
+	existing := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: mongosDeployment.Name, Namespace: mongosDeployment.Namespace}, existing)
+	if err != nil && errors.IsNotFound(err) {
+		logger.Info("Creating Mongos Deployment", "name", mongosDeployment.Name)
+		return r.Create(ctx, mongosDeployment)
+	} else if err != nil {
+		return err
+	}
+
+	// Check if update is needed
+	if !r.deploymentNeedsUpdate(existing, mongosDeployment) {
+		return nil
+	}
+
+	// Update with retry for concurrency issues
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Get the latest version
+		if err := r.Get(ctx, types.NamespacedName{Name: existing.Name, Namespace: existing.Namespace}, existing); err != nil {
+			return err
+		}
+		existing.Spec = mongosDeployment.Spec
+		logger.Info("Updating Mongos Deployment", "name", mongosDeployment.Name)
+		return r.Update(ctx, existing)
+	})
+}
+
+func (r *OperatorReconciler) statefulSetNeedsUpdate(existing, desired *appsv1.StatefulSet) bool {
+	if *existing.Spec.Replicas != *desired.Spec.Replicas {
+		return true
+	}
+	if existing.Spec.Template.Spec.Containers[0].Image != desired.Spec.Template.Spec.Containers[0].Image {
+		return true
+	}
+	if !reflect.DeepEqual(existing.Spec.Template.Spec.Containers[0].Command, desired.Spec.Template.Spec.Containers[0].Command) {
+		return true
+	}
+	return false
+}
+
+func (r *OperatorReconciler) deploymentNeedsUpdate(existing, desired *appsv1.Deployment) bool {
+	if *existing.Spec.Replicas != *desired.Spec.Replicas {
+		return true
+	}
+	if existing.Spec.Template.Spec.Containers[0].Image != desired.Spec.Template.Spec.Containers[0].Image {
+		return true
+	}
+	if !reflect.DeepEqual(existing.Spec.Template.Spec.Containers[0].Command, desired.Spec.Template.Spec.Containers[0].Command) {
+		return true
+	}
+	return false
+}
+
+func (r *OperatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&webappv1.Operator{}).
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&batchv1.Job{}).
+		Owns(&corev1.Service{}).
+		Complete(r)
+}
+
+// Helper function
+func int32Ptr(i int32) *int32 { return &i }
