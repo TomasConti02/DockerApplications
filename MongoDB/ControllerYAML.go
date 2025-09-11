@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"fmt"
 	"io"
 	"text/template"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -24,6 +26,7 @@ import (
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 //go:embed mongo-statefulset.yaml
 var mongoTemplate []byte
@@ -40,6 +43,12 @@ func (r *OperatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	operator := &webappv1.Operator{}
 	if err := r.Get(ctx, req.NamespacedName, operator); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// ---- STEP 0: Pulisci le risorse obsolete prima di crearne di nuove ----
+	if err := r.cleanupObsoleteResources(ctx, operator); err != nil {
+		logger.Error(err, "Errore nella pulizia delle risorse obsolete")
+		return ctrl.Result{}, err
 	}
 
 	// ---- STEP 1: renderizzo il template YAML con i valori della CR ----
@@ -116,8 +125,32 @@ func (r *OperatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 		// ---- Qui uso CreateOrUpdate per evitare loop ----
 		_, err = controllerutil.CreateOrUpdate(ctx, r.Client, typedObj.(client.Object), func() error {
-			// In questo callback possiamo aggiornare lo stato desiderato
-			return nil // il typedObj già contiene lo stato corretto dal template
+			// Aggiorna i campi che potrebbero essere cambiati nella CR
+			switch obj := typedObj.(type) {
+			case *appsv1.StatefulSet:
+				// Per StatefulSet, aggiorna replica count e immagine
+				if *obj.Spec.Replicas != int32(operator.Spec.Replicas) {
+					replicas := int32(operator.Spec.Replicas)
+					obj.Spec.Replicas = &replicas
+				}
+				for i := range obj.Spec.Template.Spec.Containers {
+					if obj.Spec.Template.Spec.Containers[i].Name == "mongo" {
+						obj.Spec.Template.Spec.Containers[i].Image = operator.Spec.MongoImage
+					}
+				}
+			case *appsv1.Deployment:
+				// Per Deployment, aggiorna replica count e immagine
+				if *obj.Spec.Replicas != int32(operator.Spec.ConfigReplicas) {
+					replicas := int32(operator.Spec.ConfigReplicas)
+					obj.Spec.Replicas = &replicas
+				}
+				for i := range obj.Spec.Template.Spec.Containers {
+					if obj.Spec.Template.Spec.Containers[i].Name == "mongo" {
+						obj.Spec.Template.Spec.Containers[i].Image = operator.Spec.MongoImage
+					}
+				}
+			}
+			return nil
 		})
 		if err != nil {
 			logger.Error(err, "Errore in CreateOrUpdate", "gvk", gvk)
@@ -127,8 +160,86 @@ func (r *OperatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	logger.Info("Cluster MongoDB configurato con successo")
-	return ctrl.Result{}, nil
+	// ---- STEP 3: verifica se tutti i pod sono ready ----
+	allReady, err := r.areAllPodsReady(ctx, operator.Namespace)
+	if err != nil {
+		logger.Error(err, "Errore verificando lo stato dei pod")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if allReady {
+		logger.Info("CI SIAMOOO - Tutti i pod sono ready!")
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("Alcuni pod non sono ancora ready, verifico di nuovo tra 10 secondi")
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// cleanupObsoleteResources elimina le risorse che non sono più necessarie
+func (r *OperatorReconciler) cleanupObsoleteResources(ctx context.Context, operator *webappv1.Operator) error {
+	logger := log.FromContext(ctx)
+
+	// Elimina StatefulSet di shard obsoleti
+	stsList := &appsv1.StatefulSetList{}
+	if err := r.List(ctx, stsList, client.InNamespace(operator.Namespace)); err != nil {
+		return err
+	}
+
+	for _, sts := range stsList.Items {
+		// Controlla se lo StatefulSet appartiene a questo operatore
+		if metav1.IsControlledBy(&sts, operator) {
+			// Estrai il numero di shard dal nome (es: "mongodb-shard-2")
+			var shardNumber int
+			_, err := fmt.Sscanf(sts.Name, "mongodb-shard-%d", &shardNumber)
+			if err == nil && shardNumber >= operator.Spec.Shards {
+				// Questo shard non è più necessario
+				logger.Info("Eliminando shard obsoleto", "shard", sts.Name)
+				if err := r.Delete(ctx, &sts); err != nil {
+					logger.Error(err, "Errore eliminando shard obsoleto", "shard", sts.Name)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// areAllPodsReady verifica se tutti i pod nel namespace sono ready
+func (r *OperatorReconciler) areAllPodsReady(ctx context.Context, namespace string) (bool, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(namespace)); err != nil {
+		return false, err
+	}
+
+	if len(podList.Items) == 0 {
+		return false, nil
+	}
+
+	for _, pod := range podList.Items {
+		if !isPodReady(&pod) {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// isPodReady verifica se un pod è ready
+func isPodReady(pod *corev1.Pod) bool {
+	// Controlla se il pod è in fase Running
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+
+	// Controlla che tutti i container siano ready
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if !containerStatus.Ready {
+			return false
+		}
+	}
+
+	return true
 }
 
 func getObjectName(obj runtime.Object) string {
