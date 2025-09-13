@@ -1,0 +1,172 @@
+# =========================
+# Config Servers
+# =========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Name }}-configsvr-svc
+  namespace: {{ .Namespace }}
+  labels:
+    app: {{ .Name }}-configsvr
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Name }}-configsvr
+  ports:
+    - port: 27017
+      name: mongodb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Name }}-configsvr
+  namespace: {{ .Namespace }}
+spec:
+  serviceName: {{ .Name }}-configsvr-svc
+  replicas: {{ .ConfigReplicas }}
+  selector:
+    matchLabels:
+      app: {{ .Name }}-configsvr
+  template:
+    metadata:
+      labels:
+        app: {{ .Name }}-configsvr
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: mongod
+        image: {{ .MongoImage }}
+        command:
+          - mongod
+          - "--replSet"
+          - "configRepl"
+          - "--bind_ip_all"
+          - "--port"
+          - "27017"
+          - "--dbpath"
+          - "/data/db"
+          - "--configsvr"
+        ports:
+        - containerPort: 27017
+          name: mongodb
+        volumeMounts:
+        - name: mongo-data
+          mountPath: /data/db
+  volumeClaimTemplates:
+  - metadata:
+      name: mongo-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: {{ .StorageClassName }}
+      resources:
+        requests:
+          storage: {{ .StorageSize }}
+
+# =========================
+# Shards
+# =========================
+{{- range $i := until .Shards }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Name }}-shard{{ $i }}-svc  # <-- Cambiato da add1 $i a $i
+  namespace: {{ $.Namespace }}
+  labels:
+    app: {{ $.Name }}-shard{{ $i }}     # <-- Cambiato da add1 $i a $i
+spec:
+  clusterIP: None
+  selector:
+    app: {{ $.Name }}-shard{{ $i }}     # <-- Cambiato da add1 $i a $i
+  ports:
+    - port: 27017
+      name: mongodb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $.Name }}-shard{{ $i }}      # <-- Cambiato da add1 $i a $i
+  namespace: {{ $.Namespace }}
+spec:
+  serviceName: {{ $.Name }}-shard{{ $i }}-svc  # <-- Cambiato da add1 $i a $i
+  replicas: {{ $.Replicas }}
+  selector:
+    matchLabels:
+      app: {{ $.Name }}-shard{{ $i }}   # <-- Cambiato da add1 $i a $i
+  template:
+    metadata:
+      labels:
+        app: {{ $.Name }}-shard{{ $i }} # <-- Cambiato da add1 $i a $i
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: mongod
+        image: {{ $.MongoImage }}
+        command:
+          - mongod
+          - "--replSet"
+          - "shard{{ $i }}"             # <-- Cambiato da add1 $i a $i
+          - "--bind_ip_all"
+          - "--port"
+          - "27017"
+          - "--dbpath"
+          - "/data/db"
+          - "--shardsvr"
+        ports:
+        - containerPort: 27017
+          name: mongodb
+        volumeMounts:
+        - name: mongo-data
+          mountPath: /data/db
+  volumeClaimTemplates:
+  - metadata:
+      name: mongo-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: {{ $.StorageClassName }}
+      resources:
+        requests:
+          storage: {{ $.StorageSize }}
+{{- end }}
+# =========================
+# Mongos Router
+# =========================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Name }}-mongos
+  namespace: {{ .Namespace }}
+spec:
+  selector:
+    app: {{ .Name }}-mongos
+  ports:
+    - port: 27017
+      targetPort: 27017
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Name }}-mongos
+  namespace: {{ .Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Name }}-mongos
+  template:
+    metadata:
+      labels:
+        app: {{ .Name }}-mongos
+    spec:
+      containers:
+      - name: mongos
+        image: {{ .MongoImage }}
+        command:
+          - mongos
+          - "--configdb"
+          - "configRepl/{{ .Name }}-configsvr-0.{{ .Name }}-configsvr-svc.{{ .Namespace }}.svc.cluster.local:27017{{- range $i := until (sub .ConfigReplicas 1) }},{{ $.Name }}-configsvr-{{ add1 $i }}.{{ $.Name }}-configsvr-svc.{{ $.Namespace }}.svc.cluster.local:27017{{- end }}"
+          - "--bind_ip_all"
+        ports:
+        - containerPort: 27017
